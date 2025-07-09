@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>錢進美股 數鈔機</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .quantity-btn.selected {
+      @apply bg-gray-500 text-white border-gray-600;
+    }
+    .error-shake {
+      animation: shake 0.3s;
+    }
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-5px); }
+      75% { transform: translateX(5px); }
+    }
+    /* Spinner 樣式 */
+    .spinner {
+      border: 4px solid rgba(0, 0, 0, 0.1);
+      border-left-color: #3B82F6; /* Tailwind blue-500 */
+      border-radius: 50%;
+      width: 1.5rem;
+      height: 1.5rem;
+      animation: spin 1s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+      margin-left: 0.5rem;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
+  <div class="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">
+    <h2 class="text-2xl font-bold text-center mb-6">錢進美股 數鈔機</h2>
+
+    <div class="mb-4">
+      <label for="price" class="block text-lg font-medium mb-2">股價 (USD)</label>
+      <input
+        type="number"
+        id="price"
+        step="0.01"
+        min="0"
+        class="w-full p-2 border rounded-lg focus:ring-2 focus:ring-gray-500"
+        placeholder="輸入美元股價"
+        aria-describedby="price-error"
+      />
+      <p id="price-error" class="text-red-500 text-sm mt-1 hidden" role="alert"></p>
+    </div>
+
+    <div class="mb-4">
+      <label for="quantityButtons" class="block text-lg font-medium mb-2">股數</label>
+      <div id="quantityButtons" class="grid grid-cols-4 gap-2"></div>
+      <p id="quantity-error" class="text-red-500 text-sm mt-1 hidden" role="alert"></p>
+    </div>
+
+    <div class="mb-4">
+      <label for="exchangeRateInfo" class="block text-lg font-medium mb-2">當前匯率 (TWD/USD)</label>
+      <div id="exchangeRateInfo" class="text-lg text-gray-600 flex flex-col">
+        <span id="currentRateDisplay"></span>
+      </div>
+
+      <div class="mt-4">
+        <label for="historyDate" class="block text-base font-medium mb-2">或查詢歷史匯率</label>
+        <input
+          type="date"
+          id="historyDate"
+          class="w-full p-2 border rounded-lg focus:ring-2 focus:ring-gray-500"
+          aria-label="選擇查詢歷史匯率的日期"
+        />
+        <p id="rate-error" class="text-red-500 text-sm mt-1 hidden" role="alert"></p>
+      </div>
+      <input
+        type="number"
+        id="manualRate"
+        step="0.01"
+        min="0"
+        class="w-full p-2 border rounded-lg mt-2 hidden"
+        placeholder="手動輸入匯率"
+        aria-describedby="rate-error-manual"
+      />
+      <p id="rate-error-manual" class="text-red-500 text-sm mt-1 hidden" role="alert"></p>
+    </div>
+
+    <div id="result" class="mt-6 text-lg font-bold text-center flex flex-col items-center"></div>
+
+    <button
+      id="clearBtn"
+      class="mt-6 w-full py-2 px-4 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-400"
+      aria-label="清除所有輸入和計算結果"
+    >
+      清除
+    </button>
+  </div>
+
+  <script>
+    const config = {
+      quantities: [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+      defaultRate: 29.10,
+      apiUrl: 'https://open.er-api.com/v6/latest/USD', // 即時匯率 API
+      historyApiUrl: 'https://open.er-api.com/v6/{{DATE}}/USD', // 歷史匯率 API
+      retryInterval: 5 * 60 * 1000, // 5 分鐘重試
+      errorMessages: {
+        invalidPrice: '請輸入有效股價 (大於 0)',
+        noQuantity: '請選擇或輸入股數',
+        noRate: '無法獲取匯率，請手動輸入或稍後再試',
+        historyRateFailed: '無法獲取該日期匯率，請檢查日期或稍後再試',
+      },
+    };
+
+    const state = {
+      selectedQuantity: null,
+      selectedRate: null,
+      lastValidRate: localStorage.getItem('lastValidRate') || config.defaultRate,
+      lastUpdateTime: null,
+      isFetchingRate: false, // 新增狀態：是否正在獲取匯率
+    };
+
+    const elements = {
+      priceInput: document.getElementById('price'),
+      quantityButtons: document.getElementById('quantityButtons'),
+      exchangeRateInfo: document.getElementById('exchangeRateInfo'),
+      currentRateDisplay: document.getElementById('currentRateDisplay'),
+      historyDateInput: document.getElementById('historyDate'),
+      manualRateInput: document.getElementById('manualRate'),
+      result: document.getElementById('result'),
+      clearBtn: document.getElementById('clearBtn'),
+      priceError: document.getElementById('price-error'),
+      quantityError: document.getElementById('quantity-error'),
+      rateError: document.getElementById('rate-error'), // 用於歷史匯率和自動匯率錯誤
+      manualRateError: document.getElementById('rate-error-manual'), // 用於手動匯率錯誤
+    };
+
+    const debounce = (func, delay) => {
+      let timeoutId;
+      return (...args) => {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => func(...args), delay);
+      };
+    };
+
+    // 將 UTC 時間轉為台灣時間 (CST, UTC+8)
+    const formatDateToCST = (utcDateString) => {
+      if (!utcDateString) return '';
+      const date = new Date(utcDateString);
+      // setHours 會自動處理時區轉換，使其顯示為本地時間並標註 CST
+      // 由於 time_last_update_utc 本身是 UTC 時間，我們直接將其顯示為本地時間並標註 CST
+      const options = { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Asia/Taipei' };
+      return date.toLocaleString('zh-TW', options) + ' (CST)';
+    };
+
+    const showLoadingSpinner = (element) => {
+      element.innerHTML = '正在載入匯率 <span class="spinner"></span>';
+      state.isFetchingRate = true;
+    };
+
+    const hideLoadingSpinner = () => {
+      state.isFetchingRate = false;
+    };
+
+    const showError = (element, message) => {
+      element.textContent = message;
+      element.classList.remove('hidden');
+    };
+
+    const hideError = (element) => {
+      element.classList.add('hidden');
+      element.textContent = '';
+    };
+
+    const clearAllErrors = () => {
+      hideError(elements.priceError);
+      hideError(elements.quantityError);
+      hideError(elements.rateError);
+      hideError(elements.manualRateError);
+      elements.priceInput.classList.remove('border-red-500', 'error-shake');
+    };
+
+    const fetchExchangeRate = async (date = 'latest') => {
+      if (state.isFetchingRate) return;
+
+      clearAllErrors();
+      showLoadingSpinner(elements.currentRateDisplay);
+      elements.manualRateInput.classList.add('hidden'); // 隱藏手動輸入框
+
+      let url = config.apiUrl;
+      if (date !== 'latest') {
+        url = config.historyApiUrl.replace('{{DATE}}', date);
+      }
+
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`API 請求失敗: ${response.status}`);
+        const data = await response.json();
+
+        if (data.result === 'success' && data.rates && data.rates.TWD) {
+          state.selectedRate = data.rates.TWD;
+          state.lastValidRate = state.selectedRate;
+          state.lastUpdateTime = data.time_last_update_utc;
+          localStorage.setItem('lastValidRate', state.selectedRate);
+          elements.currentRateDisplay.innerHTML = `
+            <span>當前匯率: ${state.selectedRate.toFixed(2)}</span>
+            <span class="block text-sm text-gray-500">更新於 ${formatDateToCST(state.lastUpdateTime)}</span>
+          `;
+          elements.manualRateInput.classList.add('hidden');
+          calculate();
+        } else {
+          throw new Error(date === 'latest' ? '無台幣匯率資料' : '該日期無台幣匯率資料');
+        }
+      } catch (error) {
+        console.error('匯率 API 錯誤:', error);
+        state.selectedRate = state.lastValidRate; // 使用備用匯率
+        elements.currentRateDisplay.innerHTML = `
+          <span>當前匯率: ${state.selectedRate.toFixed(2)}</span>
+          <span class="block text-sm text-gray-500">備用匯率 (來自上次成功獲取或預設值)</span>
+        `;
+        elements.manualRateInput.classList.remove('hidden'); // 顯示手動輸入框
+        elements.manualRateInput.value = state.selectedRate; // 帶入備用匯率
+        showError(elements.rateError, date === 'latest' ? config.errorMessages.noRate : config.errorMessages.historyRateFailed);
+        calculate(); // 嘗試使用備用匯率計算
+        // 如果是自動獲取失敗，才設定重試
+        if (date === 'latest') {
+          setTimeout(fetchExchangeRate, config.retryInterval);
+        }
+      } finally {
+        hideLoadingSpinner();
+      }
+    };
+
+    const setupQuantityButtons = () => {
+      elements.quantityButtons.innerHTML = ''; // 清空預設按鈕，避免重複
+      config.quantities.forEach(qty => {
+        const btn = document.createElement('button');
+        btn.textContent = qty;
+        btn.className = 'quantity-btn p-2 border rounded-lg hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-500';
+        btn.setAttribute('aria-label', `選擇 ${qty} 股`);
+        btn.addEventListener('click', () => {
+          state.selectedQuantity = qty;
+          elements.quantityButtons.querySelectorAll('button').forEach(b => b.classList.remove('selected'));
+          btn.classList.add('selected');
+          localStorage.setItem('selectedQuantity', qty); // 保存選定的股數
+          hideError(elements.quantityError); // 選擇後隱藏錯誤
+          calculate();
+        });
+        elements.quantityButtons.appendChild(btn);
+      });
+
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.min = 1;
+      input.placeholder = '自訂股數';
+      input.className = 'p-2 border rounded-lg col-span-2 focus:ring-2 focus:ring-gray-500';
+      input.setAttribute('aria-label', '輸入自訂股數');
+      input.addEventListener('input', (e) => {
+        const qty = parseInt(e.target.value);
+        if (qty > 0) {
+          state.selectedQuantity = qty;
+          elements.quantityButtons.querySelectorAll('button').forEach(b => b.classList.remove('selected'));
+          localStorage.setItem('selectedQuantity', qty); // 保存自訂股數
+          hideError(elements.quantityError); // 輸入後隱藏錯誤
+          debounce(calculate, 300)();
+        } else {
+          state.selectedQuantity = null; // 無效輸入則清空股數
+          hideError(elements.quantityError); // 不立即顯示錯誤，等待計算時再提示
+          debounce(calculate, 300)();
+        }
+      });
+      elements.quantityButtons.appendChild(input);
+
+      // 載入保存的股數
+      const savedQuantity = localStorage.getItem('selectedQuantity');
+      if (savedQuantity) {
+        state.selectedQuantity = parseInt(savedQuantity);
+        const savedBtn = Array.from(elements.quantityButtons.querySelectorAll('button')).find(btn => parseInt(btn.textContent) === state.selectedQuantity);
+        if (savedBtn) {
+          savedBtn.classList.add('selected');
+        } else {
+          input.value = savedQuantity;
+        }
+      }
+    };
+
+    const validateInputs = (price) => {
+      let hasError = false;
+      clearAllErrors(); // 每次驗證前清空所有錯誤
+
+      if (isNaN(price) || price <= 0) {
+        showError(elements.priceError, config.errorMessages.invalidPrice);
+        elements.priceInput.classList.add('border-red-500', 'error-shake');
+        hasError = true;
+      }
+
+      if (!state.selectedQuantity) {
+        showError(elements.quantityError, config.errorMessages.noQuantity);
+        hasError = true;
+      }
+      
+      // 只有在手動匯率框顯示時才檢查手動匯率
+      if (!elements.manualRateInput.classList.contains('hidden')) {
+          const manualRate = parseFloat(elements.manualRateInput.value);
+          if (isNaN(manualRate) || manualRate <= 0) {
+              showError(elements.manualRateError, '請輸入有效手動匯率');
+              hasError = true;
+          }
+      }
+
+      // 如果有手動匯率且有效，則不再檢查 state.selectedRate
+      if (elements.manualRateInput.value && parseFloat(elements.manualRateInput.value) > 0) {
+        // 已經有手動匯率了，不檢查 state.selectedRate
+      } else if (!state.selectedRate || state.selectedRate <= 0) {
+        showError(elements.rateError, config.errorMessages.noRate);
+        hasError = true;
+      }
+      
+      return hasError ? 'validation_failed' : null; // 返回一個特殊字串表示有錯誤
+    };
+
+    const calculate = () => {
+      const price = parseFloat(elements.priceInput.value);
+      elements.result.innerHTML = ''; // 清空之前的內容
+
+      const validationError = validateInputs(price);
+      if (validationError) {
+        elements.result.innerHTML = `<span class="text-red-500">${config.errorMessages[validationError] || '請檢查輸入'}</span>`;
+        return;
+      }
+      
+      // 如果手動匯率框顯示且有值，則優先使用手動匯率
+      const finalRate = (!elements.manualRateInput.classList.contains('hidden') && parseFloat(elements.manualRateInput.value) > 0)
+                          ? parseFloat(elements.manualRateInput.value)
+                          : state.selectedRate;
+
+      if (!finalRate || finalRate <= 0) {
+        showError(elements.rateError, config.errorMessages.noRate);
+        elements.result.innerHTML = `<span class="text-red-500">${config.errorMessages.noRate}</span>`;
+        return;
+      }
+
+      const totalUSD = price * state.selectedQuantity; // 計算原始美元金額
+      const totalTWD = totalUSD * finalRate;
+      const roundedTotalTWD = Math.round(totalTWD); // 四捨五入到整數台幣
+
+      // 使用 Grid 佈局來實現精確的欄位對齊
+      elements.result.innerHTML = `
+        <div class="grid grid-cols-[1fr_1fr_auto] gap-x-4 items-baseline w-full">
+            <span class="col-start-1 text-gray-600 justify-self-end">總金額：</span>
+            <span class="col-start-2 text-orange-600 text-3xl font-extrabold text-right">${roundedTotalTWD.toLocaleString()}</span>
+            <span class="col-start-3 text-gray-600 text-right">台幣</span>
+
+            <span class="col-start-1 text-gray-600 invisible mt-2 justify-self-end">總金額：</span>
+            <span class="col-start-2 text-gray-500 text-xl font-normal mt-2 text-right">${totalUSD.toFixed(1).toLocaleString()}</span>
+            <span class="col-start-3 text-gray-500 text-xl font-normal mt-2 text-right">USD</span>
+        </div>
+      `;
+    };
+
+    const clearInputs = () => {
+        elements.priceInput.value = '';
+        elements.historyDateInput.value = '';
+        elements.manualRateInput.value = '';
+        elements.manualRateInput.classList.add('hidden'); // 隱藏手動輸入
+        elements.result.innerHTML = '';
+        state.selectedQuantity = null;
+        elements.quantityButtons.querySelectorAll('button').forEach(b => b.classList.remove('selected'));
+        localStorage.removeItem('selectedQuantity');
+        localStorage.removeItem('lastValidRate');
+        localStorage.removeItem('savedPrice'); // 清除保存的股價
+        state.selectedRate = null; // 清除當前選定的匯率，會觸發重新獲取
+        clearAllErrors();
+        elements.currentRateDisplay.innerHTML = ''; // 清空匯率顯示
+        fetchExchangeRate(); // 重新獲取最新匯率
+    };
+
+
+    const init = () => {
+      setupQuantityButtons();
+      fetchExchangeRate(); // 頁面載入時獲取一次即時匯率
+
+      // 事件監聽器
+      elements.priceInput.addEventListener('input', (e) => {
+        if (parseFloat(e.target.value) < 0) e.target.value = '';
+        hideError(elements.priceError); // 修正後隱藏錯誤
+        localStorage.setItem('savedPrice', e.target.value); // 保存股價
+        debounce(calculate, 300)();
+      });
+
+      elements.historyDateInput.addEventListener('change', (e) => {
+        const selectedDate = e.target.value;
+        if (selectedDate) {
+          elements.currentRateDisplay.innerHTML = ''; // 清空即時匯率顯示
+          fetchExchangeRate(selectedDate);
+          elements.manualRateInput.classList.add('hidden'); // 選擇歷史匯率時隱藏手動輸入
+        } else {
+          // 如果日期被清空，重新獲取即時匯率
+          fetchExchangeRate();
+        }
+      });
+
+      elements.manualRateInput.addEventListener('input', (e) => {
+        const rate = parseFloat(e.target.value);
+        if (rate > 0) {
+          state.selectedRate = rate;
+          state.lastValidRate = rate;
+          state.lastUpdateTime = null; // 手動輸入沒有更新時間
+          localStorage.setItem('lastValidRate', rate);
+          elements.currentRateDisplay.innerHTML = `
+            <span>當前匯率: ${state.selectedRate.toFixed(2)}</span>
+            <span class="block text-sm text-gray-500">手動輸入</span>
+          `;
+          hideError(elements.rateError);
+          hideError(elements.manualRateError); // 輸入後隱藏錯誤
+          debounce(calculate, 300)();
+        } else {
+          state.selectedRate = null; // 無效輸入則清空匯率
+          hideError(elements.manualRateError); // 不立即顯示錯誤，等待計算時再提示
+          debounce(calculate, 300)();
+        }
+      });
+
+      elements.clearBtn.addEventListener('click', clearInputs);
+
+      // 載入保存的股價
+      const savedPrice = localStorage.getItem('savedPrice');
+      if (savedPrice) {
+        elements.priceInput.value = savedPrice;
+        calculate(); // 載入後重新計算一次
+      }
+    };
+
+    init();
+  </script>
+</body>
+</html>
